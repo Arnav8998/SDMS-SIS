@@ -1,0 +1,252 @@
+-- ============================================================
+-- Secure Document Management System (SDMS)
+-- SQLite Database Script
+-- ============================================================
+-- This script creates the database structure for the SDMS system.
+-- It supports register, login, logout, upload document, download
+-- document, search/view documents, reserve document, and release
+-- reservation.
+-- ============================================================
+
+-- ============================================================
+-- - Step 1: Remove old tables if they already exist
+-- - This makes the script safe to rerun during testing.
+-- - Child tables are dropped before parent tables to avoid FK issues.
+-- ============================================================
+
+DROP TABLE IF EXISTS AuditLogs;
+DROP TABLE IF EXISTS Reservations;
+DROP TABLE IF EXISTS Documents;
+DROP TABLE IF EXISTS Sessions;
+DROP TABLE IF EXISTS Users;
+
+
+-- ============================================================
+-- - Step 2: Create Users table
+-- - This table stores registered users.
+-- - emailEncrypted represents protected email storage.
+-- - passwordHash stores the hashed password, not the real password.
+-- - isActive controls whether the account can still be used.
+-- ============================================================
+
+CREATE TABLE Users (
+    userID INTEGER PRIMARY KEY AUTOINCREMENT,
+    fullName TEXT NOT NULL,
+    emailEncrypted TEXT NOT NULL UNIQUE,
+    passwordHash TEXT NOT NULL,
+    isActive INTEGER NOT NULL DEFAULT 1,
+    createdAt TEXT NOT NULL
+);
+
+
+-- ============================================================
+-- - Step 3: Create Sessions table
+-- - This table stores active and expired login sessions.
+-- - Login creates a session.
+-- - Logout sets isActive to 0.
+-- - expiresAt prevents old sessions from being reused.
+-- ============================================================
+
+CREATE TABLE Sessions (
+    sessionID INTEGER PRIMARY KEY AUTOINCREMENT,
+    userID INTEGER NOT NULL,
+    createdAt TEXT NOT NULL,
+    expiresAt TEXT NOT NULL,
+    isActive INTEGER NOT NULL DEFAULT 1,
+    FOREIGN KEY (userID) REFERENCES Users(userID)
+);
+
+
+-- ============================================================
+-- - Step 4: Create Documents table
+-- - This table stores document metadata.
+-- - filePath stores where the actual document is saved.
+-- - encrypted shows whether the document is protected.
+-- - uploadedBy links the document to the user who uploaded it.
+-- ============================================================
+
+CREATE TABLE Documents (
+    documentID INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    filePath TEXT NOT NULL,
+    category TEXT NOT NULL,
+    encrypted INTEGER NOT NULL DEFAULT 1,
+    uploadedBy INTEGER NOT NULL,
+    timestamp TEXT NOT NULL,
+    FOREIGN KEY (uploadedBy) REFERENCES Users(userID)
+);
+
+
+-- ============================================================
+-- - Step 5: Create Reservations table
+-- - This table stores document reservations.
+-- - A reservation links one user to one document.
+-- - status can be ACTIVE, RELEASED, or EXPIRED.
+-- - expiresAt controls how long the reservation lasts.
+-- ============================================================
+
+CREATE TABLE Reservations (
+    reservationID INTEGER PRIMARY KEY AUTOINCREMENT,
+    documentID INTEGER NOT NULL,
+    userID INTEGER NOT NULL,
+    reservedAt TEXT NOT NULL,
+    expiresAt TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'ACTIVE',
+    FOREIGN KEY (documentID) REFERENCES Documents(documentID),
+    FOREIGN KEY (userID) REFERENCES Users(userID)
+);
+
+
+-- ============================================================
+-- - Step 6: Create AuditLogs table
+-- - This table records every important user/system action.
+-- - It supports traceability, accountability, and security monitoring.
+-- - outcome records whether the action succeeded or failed.
+-- ============================================================
+
+CREATE TABLE AuditLogs (
+    logID INTEGER PRIMARY KEY AUTOINCREMENT,
+    userID INTEGER,
+    action TEXT NOT NULL,
+    targetID INTEGER,
+    timestamp TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    FOREIGN KEY (userID) REFERENCES Users(userID)
+);
+
+
+-- ============================================================
+-- - Step 7: Add indexes for faster searching
+-- - Indexes improve performance when searching documents,
+-- - checking active sessions, and checking active reservations.
+-- ============================================================
+
+CREATE INDEX IX_Users_Email ON Users(emailEncrypted);
+CREATE INDEX IX_Sessions_User_Active ON Sessions(userID, isActive);
+CREATE INDEX IX_Documents_Title_Category ON Documents(title, category);
+CREATE INDEX IX_Reservations_Document_Status ON Reservations(documentID, status);
+CREATE INDEX IX_AuditLogs_User_Action ON AuditLogs(userID, action);
+
+
+-- ============================================================
+-- - Step 8: Register example user
+-- - This simulates the register() process.
+-- - The passwordHash value is only a placeholder for demonstration.
+-- ============================================================
+
+INSERT INTO Users (fullName, emailEncrypted, passwordHash, isActive, createdAt)
+VALUES ('Student User', 'student@example.com', 'HASHED_PASSWORD_EXAMPLE', 1, datetime('now'));
+
+
+-- ============================================================
+-- - Step 9: Login example user
+-- - This simulates the login() process.
+-- - A successful login creates an active session.
+-- ============================================================
+
+INSERT INTO Sessions (userID, createdAt, expiresAt, isActive)
+VALUES (1, datetime('now'), datetime('now', '+2 hours'), 1);
+
+
+-- ============================================================
+-- - Step 10: Upload document example
+-- - This simulates uploadDocument().
+-- - The document metadata is saved in the Documents table.
+-- ============================================================
+
+INSERT INTO Documents (title, filePath, category, encrypted, uploadedBy, timestamp)
+VALUES ('SDMS Design Notes', './uploads/sdms_notes.txt', 'Coursework', 1, 1, datetime('now'));
+
+
+-- ============================================================
+-- - Step 11: Search/view document example
+-- - This simulates searchDocument() and viewDocument().
+-- - The query retrieves documents by title or category.
+-- ============================================================
+
+SELECT documentID, title, filePath, category, encrypted, uploadedBy, timestamp
+FROM Documents
+WHERE title LIKE '%SDMS%' OR category LIKE '%SDMS%';
+
+
+-- ============================================================
+-- - Step 12: Download document example
+-- - This simulates downloadDocument().
+-- - The database returns the file path so the backend can read the file.
+-- ============================================================
+
+SELECT documentID, title, filePath
+FROM Documents
+WHERE documentID = 1;
+
+
+-- ============================================================
+-- - Step 13: Reserve document example
+-- - This simulates reserveDocument().
+-- - The system first checks whether the document already has an
+-- - active reservation before creating a new one.
+-- ============================================================
+
+SELECT *
+FROM Reservations
+WHERE documentID = 1
+  AND status = 'ACTIVE'
+  AND expiresAt > datetime('now');
+
+INSERT INTO Reservations (documentID, userID, reservedAt, expiresAt, status)
+VALUES (1, 1, datetime('now'), datetime('now', '+24 hours'), 'ACTIVE');
+
+
+-- ============================================================
+-- - Step 14: Release reservation example
+-- - This simulates releaseReservation().
+-- - The active reservation is changed to RELEASED.
+-- ============================================================
+
+UPDATE Reservations
+SET status = 'RELEASED'
+WHERE reservationID = 1
+  AND userID = 1
+  AND status = 'ACTIVE';
+
+
+-- ============================================================
+-- - Step 15: Logout example
+-- - This simulates logout().
+-- - The active session is marked as inactive.
+-- ============================================================
+
+UPDATE Sessions
+SET isActive = 0
+WHERE sessionID = 1
+  AND userID = 1;
+
+
+-- ============================================================
+-- - Step 16: Audit logging examples
+-- - This records actions performed by the user.
+-- - In the Python code, AuditLog.record_event() does this automatically.
+-- ============================================================
+
+INSERT INTO AuditLogs (userID, action, targetID, timestamp, outcome)
+VALUES
+(1, 'REGISTER', 1, datetime('now'), 'SUCCESS'),
+(1, 'LOGIN', 1, datetime('now'), 'SUCCESS'),
+(1, 'UPLOAD_DOCUMENT', 1, datetime('now'), 'SUCCESS'),
+(1, 'SEARCH_DOCUMENTS', NULL, datetime('now'), 'SUCCESS'),
+(1, 'DOWNLOAD_DOCUMENT', 1, datetime('now'), 'SUCCESS'),
+(1, 'RESERVE_DOCUMENT', 1, datetime('now'), 'SUCCESS'),
+(1, 'RELEASE_RESERVATION', 1, datetime('now'), 'SUCCESS'),
+(1, 'LOGOUT', 1, datetime('now'), 'SUCCESS');
+
+
+-- ============================================================
+-- - Step 17: Final verification queries
+-- - These SELECT statements allow the marker to inspect the data.
+-- ============================================================
+
+SELECT * FROM Users;
+SELECT * FROM Sessions;
+SELECT * FROM Documents;
+SELECT * FROM Reservations;
+SELECT * FROM AuditLogs;
