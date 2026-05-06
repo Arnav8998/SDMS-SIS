@@ -1,0 +1,510 @@
+# ============================================================
+# Secure Document Management System (SDMS)
+# Python Backend Demonstration
+# ============================================================
+# This file demonstrates the main SDMS system actions:
+# register, login, logout, upload document, download document,
+# search/view documents, reserve document, and release reservation.
+# Every user action goes through the SecurityProxy before reaching
+# the correct service layer.
+# ============================================================
+
+import hashlib
+import sqlite3
+from datetime import datetime, timedelta
+from pathlib import Path
+
+
+# ============================================================
+# Database Configuration
+# ============================================================
+# This section defines the database file location.
+# In a real system, this could be replaced with SQL Server,
+# PostgreSQL, MySQL, or a cloud database connection.
+# ============================================================
+
+DB_PATH = Path(__file__).resolve().parent.parent / "database" / "sdms.db"
+UPLOAD_DIR = Path(__file__).resolve().parent.parent / "uploads"
+UPLOAD_DIR.mkdir(exist_ok=True)
+
+
+# ============================================================
+# Helper Function: Database Connection
+# ============================================================
+# This function opens a connection to the SQLite database.
+# It also allows rows to be returned like dictionaries.
+# ============================================================
+
+def get_connection():
+    connection = sqlite3.connect(DB_PATH)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+# ============================================================
+# Helper Function: Password Hashing
+# ============================================================
+# Passwords should never be stored as plain text.
+# This function hashes the password using SHA-256 for demonstration.
+# In a production system, bcrypt or Argon2 would be stronger.
+# ============================================================
+
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+# ============================================================
+# AuditLog Class
+# ============================================================
+# This class records important user and system actions.
+# It supports traceability, accountability, and security monitoring.
+# ============================================================
+
+class AuditLog:
+    @staticmethod
+    def record_event(user_id, action, target_id=None, outcome="SUCCESS"):
+        # Insert a new audit log record into the database.
+        with get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO AuditLogs (userID, action, targetID, timestamp, outcome)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (user_id, action, target_id, datetime.now().isoformat(), outcome),
+            )
+
+
+# ============================================================
+# SecurityProxy Class
+# ============================================================
+# This is the main security gatekeeper.
+# Every request must pass through this proxy before the service layer.
+# It validates input, checks authentication, checks authorisation,
+# scans files, detects malware, applies rate limiting, and forwards
+# safe requests to the correct service.
+# ============================================================
+
+class SecurityProxy:
+    def __init__(self):
+        # Store simple request counts for rate limiting demonstration.
+        self.request_counts = {}
+
+    def validate_input(self, data: dict) -> bool:
+        # Check that required request data exists and is not empty.
+        for key, value in data.items():
+            if value is None or value == "":
+                return False
+        return True
+
+    def check_authentication(self, session_id: int) -> bool:
+        # Confirm that the session exists and is active.
+        with get_connection() as conn:
+            session = conn.execute(
+                """
+                SELECT * FROM Sessions
+                WHERE sessionID = ? AND isActive = 1 AND expiresAt > ?
+                """,
+                (session_id, datetime.now().isoformat()),
+            ).fetchone()
+        return session is not None
+
+    def check_authorisation(self, user_id: int, action: str) -> bool:
+        # In this simplified system, active users are authorised.
+        # In a larger system, this would check roles and permissions.
+        with get_connection() as conn:
+            user = conn.execute(
+                "SELECT * FROM Users WHERE userID = ? AND isActive = 1",
+                (user_id,),
+            ).fetchone()
+        return user is not None
+
+    def scan_file(self, file_name: str) -> bool:
+        # File scanning demonstration.
+        # Only allow common safe document extensions.
+        allowed_extensions = [".pdf", ".docx", ".txt"]
+        return Path(file_name).suffix.lower() in allowed_extensions
+
+    def detect_malware(self, file_content: str) -> bool:
+        # Malware detection demonstration.
+        # Reject content containing suspicious keywords.
+        suspicious_terms = ["virus", "malware", "trojan", "ransomware"]
+        return not any(term in file_content.lower() for term in suspicious_terms)
+
+    def apply_rate_limit(self, user_id: int) -> bool:
+        # Simple rate limit demonstration.
+        # A user can make up to 20 requests in this program run.
+        self.request_counts[user_id] = self.request_counts.get(user_id, 0) + 1
+        return self.request_counts[user_id] <= 20
+
+    def validate_request(self, user_id: int, session_id: int, action: str, data: dict) -> bool:
+        # Run all standard security checks before forwarding the request.
+        if not self.validate_input(data):
+            AuditLog.record_event(user_id, action, outcome="FAILED_INPUT_VALIDATION")
+            return False
+
+        if not self.check_authentication(session_id):
+            AuditLog.record_event(user_id, action, outcome="FAILED_AUTHENTICATION")
+            return False
+
+        if not self.check_authorisation(user_id, action):
+            AuditLog.record_event(user_id, action, outcome="FAILED_AUTHORISATION")
+            return False
+
+        if not self.apply_rate_limit(user_id):
+            AuditLog.record_event(user_id, action, outcome="FAILED_RATE_LIMIT")
+            return False
+
+        return True
+
+    def validate_file_request(self, user_id: int, session_id: int, action: str, file_name: str, file_content: str) -> bool:
+        # Run normal request validation first.
+        if not self.validate_request(user_id, session_id, action, {"file_name": file_name}):
+            return False
+
+        # Scan the file extension.
+        if not self.scan_file(file_name):
+            AuditLog.record_event(user_id, action, outcome="FAILED_FILE_SCAN")
+            return False
+
+        # Detect suspicious file content.
+        if not self.detect_malware(file_content):
+            AuditLog.record_event(user_id, action, outcome="FAILED_MALWARE_DETECTION")
+            return False
+
+        return True
+
+
+# ============================================================
+# AuthenticationService Class
+# ============================================================
+# This service controls register, login, and logout.
+# Register creates a new user.
+# Login creates a new active session.
+# Logout destroys the active session.
+# ============================================================
+
+class AuthenticationService:
+    @staticmethod
+    def register(full_name: str, email: str, password: str) -> int:
+        # Validate registration input.
+        if not full_name or not email or not password:
+            raise ValueError("All registration fields are required.")
+
+        # Hash the password before storing it.
+        password_hash = hash_password(password)
+
+        # Insert the new user into the Users table.
+        with get_connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO Users (fullName, emailEncrypted, passwordHash, isActive, createdAt)
+                VALUES (?, ?, ?, 1, ?)
+                """,
+                (full_name, email, password_hash, datetime.now().isoformat()),
+            )
+            user_id = cursor.lastrowid
+
+        # Record registration in the audit log.
+        AuditLog.record_event(user_id, "REGISTER", user_id)
+        return user_id
+
+    @staticmethod
+    def login(email: str, password: str) -> int:
+        # Hash the entered password for comparison.
+        password_hash = hash_password(password)
+
+        # Find the matching active user.
+        with get_connection() as conn:
+            user = conn.execute(
+                """
+                SELECT * FROM Users
+                WHERE emailEncrypted = ? AND passwordHash = ? AND isActive = 1
+                """,
+                (email, password_hash),
+            ).fetchone()
+
+            if user is None:
+                raise PermissionError("Invalid email or password.")
+
+            # Create a new active session after successful login.
+            expires_at = datetime.now() + timedelta(hours=2)
+            cursor = conn.execute(
+                """
+                INSERT INTO Sessions (userID, createdAt, expiresAt, isActive)
+                VALUES (?, ?, ?, 1)
+                """,
+                (user["userID"], datetime.now().isoformat(), expires_at.isoformat()),
+            )
+            session_id = cursor.lastrowid
+
+        # Record login in the audit log.
+        AuditLog.record_event(user["userID"], "LOGIN", session_id)
+        return session_id
+
+    @staticmethod
+    def logout(user_id: int, session_id: int):
+        # Mark the session as inactive.
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE Sessions SET isActive = 0 WHERE sessionID = ? AND userID = ?",
+                (session_id, user_id),
+            )
+
+        # Record logout in the audit log.
+        AuditLog.record_event(user_id, "LOGOUT", session_id)
+
+
+# ============================================================
+# DocumentService Class
+# ============================================================
+# This service controls upload, download, search, and view actions.
+# It is only reached after the SecurityProxy validates the request.
+# ============================================================
+
+class DocumentService:
+    @staticmethod
+    def upload_document(user_id: int, title: str, file_name: str, file_content: str, category: str) -> int:
+        # Save file content to the uploads folder.
+        file_path = UPLOAD_DIR / file_name
+        file_path.write_text(file_content, encoding="utf-8")
+
+        # Store document metadata in the database.
+        with get_connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO Documents (title, filePath, category, encrypted, uploadedBy, timestamp)
+                VALUES (?, ?, ?, 1, ?, ?)
+                """,
+                (title, str(file_path), category, user_id, datetime.now().isoformat()),
+            )
+            document_id = cursor.lastrowid
+
+        # Record upload in the audit log.
+        AuditLog.record_event(user_id, "UPLOAD_DOCUMENT", document_id)
+        return document_id
+
+    @staticmethod
+    def download_document(user_id: int, document_id: int) -> str:
+        # Retrieve document metadata from the database.
+        with get_connection() as conn:
+            document = conn.execute(
+                "SELECT * FROM Documents WHERE documentID = ?",
+                (document_id,),
+            ).fetchone()
+
+        if document is None:
+            raise FileNotFoundError("Document not found.")
+
+        # Read the document file content.
+        file_content = Path(document["filePath"]).read_text(encoding="utf-8")
+
+        # Record download in the audit log.
+        AuditLog.record_event(user_id, "DOWNLOAD_DOCUMENT", document_id)
+        return file_content
+
+    @staticmethod
+    def search_documents(user_id: int, keyword: str):
+        # Search by title or category.
+        with get_connection() as conn:
+            documents = conn.execute(
+                """
+                SELECT * FROM Documents
+                WHERE title LIKE ? OR category LIKE ?
+                """,
+                (f"%{keyword}%", f"%{keyword}%"),
+            ).fetchall()
+
+        # Record search in the audit log.
+        AuditLog.record_event(user_id, "SEARCH_DOCUMENTS")
+        return documents
+
+    @staticmethod
+    def view_document(user_id: int, document_id: int):
+        # Retrieve one document's metadata.
+        with get_connection() as conn:
+            document = conn.execute(
+                "SELECT * FROM Documents WHERE documentID = ?",
+                (document_id,),
+            ).fetchone()
+
+        # Record view in the audit log.
+        AuditLog.record_event(user_id, "VIEW_DOCUMENT", document_id)
+        return document
+
+
+# ============================================================
+# ReservationService Class
+# ============================================================
+# This service controls document reservation and reservation release.
+# It checks whether a document is already actively reserved before
+# allowing a new reservation.
+# ============================================================
+
+class ReservationService:
+    @staticmethod
+    def check_availability(document_id: int) -> bool:
+        # Check for an active reservation on this document.
+        with get_connection() as conn:
+            active_reservation = conn.execute(
+                """
+                SELECT * FROM Reservations
+                WHERE documentID = ? AND status = 'ACTIVE' AND expiresAt > ?
+                """,
+                (document_id, datetime.now().isoformat()),
+            ).fetchone()
+        return active_reservation is None
+
+    @staticmethod
+    def reserve_document(user_id: int, document_id: int) -> int:
+        # Prevent reservation if the document is already reserved.
+        if not ReservationService.check_availability(document_id):
+            raise PermissionError("Document is already reserved.")
+
+        # Create a reservation record.
+        reserved_at = datetime.now()
+        expires_at = reserved_at + timedelta(hours=24)
+
+        with get_connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO Reservations (documentID, userID, reservedAt, expiresAt, status)
+                VALUES (?, ?, ?, ?, 'ACTIVE')
+                """,
+                (document_id, user_id, reserved_at.isoformat(), expires_at.isoformat()),
+            )
+            reservation_id = cursor.lastrowid
+
+        # Record reservation in the audit log.
+        AuditLog.record_event(user_id, "RESERVE_DOCUMENT", document_id)
+        return reservation_id
+
+    @staticmethod
+    def release_reservation(user_id: int, reservation_id: int):
+        # Only the user who made the reservation can release it.
+        with get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE Reservations
+                SET status = 'RELEASED'
+                WHERE reservationID = ? AND userID = ? AND status = 'ACTIVE'
+                """,
+                (reservation_id, user_id),
+            )
+
+        # Record reservation release in the audit log.
+        AuditLog.record_event(user_id, "RELEASE_RESERVATION", reservation_id)
+
+
+# ============================================================
+# SDMSController Class
+# ============================================================
+# This controller shows how the system routes every action through
+# SecurityProxy before calling AuthenticationService, DocumentService,
+# or ReservationService.
+# ============================================================
+
+class SDMSController:
+    def __init__(self):
+        self.security_proxy = SecurityProxy()
+
+    def register(self, full_name: str, email: str, password: str):
+        # Registration happens before a session exists.
+        return AuthenticationService.register(full_name, email, password)
+
+    def login(self, email: str, password: str):
+        # Login also happens before a session exists.
+        return AuthenticationService.login(email, password)
+
+    def logout(self, user_id: int, session_id: int):
+        # Logout still checks that the session is valid before destroying it.
+        if self.security_proxy.validate_request(user_id, session_id, "LOGOUT", {"session_id": session_id}):
+            AuthenticationService.logout(user_id, session_id)
+            return True
+        return False
+
+    def upload_document(self, user_id: int, session_id: int, title: str, file_name: str, file_content: str, category: str):
+        # Upload needs full file validation through SecurityProxy.
+        if self.security_proxy.validate_file_request(user_id, session_id, "UPLOAD_DOCUMENT", file_name, file_content):
+            return DocumentService.upload_document(user_id, title, file_name, file_content, category)
+        raise PermissionError("Upload request blocked by SecurityProxy.")
+
+    def download_document(self, user_id: int, session_id: int, document_id: int):
+        # Download request is validated before document access.
+        if self.security_proxy.validate_request(user_id, session_id, "DOWNLOAD_DOCUMENT", {"document_id": document_id}):
+            return DocumentService.download_document(user_id, document_id)
+        raise PermissionError("Download request blocked by SecurityProxy.")
+
+    def search_documents(self, user_id: int, session_id: int, keyword: str):
+        # Search request is validated before querying documents.
+        if self.security_proxy.validate_request(user_id, session_id, "SEARCH_DOCUMENTS", {"keyword": keyword}):
+            return DocumentService.search_documents(user_id, keyword)
+        raise PermissionError("Search request blocked by SecurityProxy.")
+
+    def view_document(self, user_id: int, session_id: int, document_id: int):
+        # View request is validated before retrieving metadata.
+        if self.security_proxy.validate_request(user_id, session_id, "VIEW_DOCUMENT", {"document_id": document_id}):
+            return DocumentService.view_document(user_id, document_id)
+        raise PermissionError("View request blocked by SecurityProxy.")
+
+    def reserve_document(self, user_id: int, session_id: int, document_id: int):
+        # Reservation request is validated before availability is checked.
+        if self.security_proxy.validate_request(user_id, session_id, "RESERVE_DOCUMENT", {"document_id": document_id}):
+            return ReservationService.reserve_document(user_id, document_id)
+        raise PermissionError("Reservation request blocked by SecurityProxy.")
+
+    def release_reservation(self, user_id: int, session_id: int, reservation_id: int):
+        # Release request is validated before updating reservation status.
+        if self.security_proxy.validate_request(user_id, session_id, "RELEASE_RESERVATION", {"reservation_id": reservation_id}):
+            ReservationService.release_reservation(user_id, reservation_id)
+            return True
+        raise PermissionError("Release request blocked by SecurityProxy.")
+
+
+# ============================================================
+# Demo Run
+# ============================================================
+# This section demonstrates the full SDMS flow.
+# It is included so the file can be executed directly.
+# ============================================================
+
+if __name__ == "__main__":
+    app = SDMSController()
+
+    # Register a new user.
+    user_id = app.register("Student User", "student@example.com", "Password123")
+    print(f"Registered user ID: {user_id}")
+
+    # Login and create a session.
+    session_id = app.login("student@example.com", "Password123")
+    print(f"Logged in with session ID: {session_id}")
+
+    # Upload a safe document.
+    document_id = app.upload_document(
+        user_id=user_id,
+        session_id=session_id,
+        title="SDMS Design Notes",
+        file_name="sdms_notes.txt",
+        file_content="This is a safe SDMS coursework document.",
+        category="Coursework",
+    )
+    print(f"Uploaded document ID: {document_id}")
+
+    # Search/view documents.
+    results = app.search_documents(user_id, session_id, "SDMS")
+    print(f"Search results found: {len(results)}")
+
+    # Download the document.
+    content = app.download_document(user_id, session_id, document_id)
+    print(f"Downloaded content: {content}")
+
+    # Reserve the document.
+    reservation_id = app.reserve_document(user_id, session_id, document_id)
+    print(f"Created reservation ID: {reservation_id}")
+
+    # Release the reservation.
+    app.release_reservation(user_id, session_id, reservation_id)
+    print("Reservation released.")
+
+    # Logout and destroy the session.
+    app.logout(user_id, session_id)
+    print("Logged out successfully.")
